@@ -8,7 +8,6 @@ import asyncio
 from asyncio import Queue
 import aiohttp
 import async_timeout
-from asyncio_throttle import Throttler
 
 
 # region: DO NOT CHANGE - the code within this region can be assumed to be "correct"
@@ -57,7 +56,7 @@ def configure_logger(name=None):
         sh.setFormatter(formatter)
         logger.addHandler(sh)
 
-        fh = logging.FileHandler(f"async-debug.log", mode="a")
+        fh = logging.FileHandler(f"async-debug-legacy.log", mode="a")
         fh.setFormatter(formatter)
         logger.addHandler(fh)
 
@@ -78,11 +77,12 @@ class RateLimiter:
         self.__curr_idx = 0
 
     @contextlib.asynccontextmanager
-    async def acquire(self, timeout_ms=0):
+    async def acquire(self, timeout_ms=0, request_counter=None):
         enter_ms = timestamp_ms()
         while True:
             now = timestamp_ms()
             if now - enter_ms > timeout_ms > 0:
+                request_counter["ignored"] += 1
                 raise RateLimiterTimeout()
 
             if now - self.__last_request_time <= self.__min_duration_ms_between_requests:
@@ -108,12 +108,13 @@ async def exchange_facing_worker(url: str, api_key: str, queue: Queue, logger: l
             request: Request = await queue.get()
             remaining_ttl = REQUEST_TTL_MS - (timestamp_ms() - request.create_time)
             if remaining_ttl <= 0:
+                request_counter["ignored"] += 1
                 logger.warning(f"ignoring request {request.req_id} from queue due to TTL")
                 continue
 
             try:
                 nonce = timestamp_ms()
-                async with rate_limiter.acquire(timeout_ms=remaining_ttl):
+                async with rate_limiter.acquire(timeout_ms=remaining_ttl, request_counter=request_counter):
                     async with async_timeout.timeout(1.0):
                         data = {'api_key': api_key, 'nonce': nonce, 'req_id': request.req_id}
                         async with session.request('GET',
@@ -129,7 +130,7 @@ async def exchange_facing_worker(url: str, api_key: str, queue: Queue, logger: l
                 logger.warning(f"ignoring request {request.req_id} in limiter due to TTL")
 
 #Function to log average requests per second
-async def log_request_rate(request_counter):
+async def log_request_rate(request_counter, logger):
     start_time = timestamp_ms()
     while True:
         await asyncio.sleep(1)  #Report every second
@@ -137,10 +138,12 @@ async def log_request_rate(request_counter):
         if elapsed_time > 0:
             avg_requests_per_second = request_counter['successful'] / elapsed_time
             avg_requests_generated_per_second = request_counter['generated'] / elapsed_time
-            print(f"Avg Successful Requests per Second: {avg_requests_per_second:.2f} (Total: {request_counter['total']})")
-            print(f"Avg Requests generated per Second: {avg_requests_generated_per_second:.2f}")
+            avg_requests_ignored_per_second = request_counter['ignored'] / elapsed_time
+            logger.info(f"Avg Successful Requests per Second: {avg_requests_per_second:.2f} (Total: {request_counter['total']})")
+            logger.info(f"Avg Requests generated per Second: {avg_requests_generated_per_second:.2f}")
+            logger.info(f"Avg Requests ignored per Second: {avg_requests_ignored_per_second:.2f}")
         else:
-            print("No requests yet.")
+            logger.info("No requests yet.")
 
 class Request:
     def __init__(self, req_id):
@@ -152,12 +155,12 @@ def main():
     url = "http://127.0.0.1:9999/api/request"
     loop = asyncio.get_event_loop()
     queue = Queue()
+    logger = configure_logger()
 
     #Track successful requests and generated requests rates
-    request_counter = {'total': 0, 'successful': 0, 'generated': 0}  # Counter for requests
-    loop.create_task(log_request_rate(request_counter))
-    
-    logger = configure_logger()
+    request_counter = {'total': 0, 'successful': 0, 'generated': 0, 'ignored':0}  # Counter for requests
+    loop.create_task(log_request_rate(request_counter, logger))
+
     loop.create_task(generate_requests(queue=queue, request_counter = request_counter))
 
     for api_key in VALID_API_KEYS:
