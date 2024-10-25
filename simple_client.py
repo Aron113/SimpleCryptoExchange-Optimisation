@@ -122,7 +122,7 @@ async def exchange_facing_worker(url: str, api_key: str, queue: Queue, logger: l
                         data = {'api_key': api_key, 'nonce': nonce, 'req_id': request.req_id}
                         async with session.request('GET',
                                                    url,
-                                                   data=data) as resp:  # type: aiohttp.ClientResponse
+                                                   params=data) as resp:  # type: aiohttp.ClientResponse
                             json = await resp.json()
                             if json['status'] == 'OK':
                                 logger.info(f"API response: status {resp.status}, resp {json}")
