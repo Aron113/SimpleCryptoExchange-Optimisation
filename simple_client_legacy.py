@@ -69,40 +69,39 @@ class RateLimiterTimeout(Exception):
     pass
 
 
-# class RateLimiter:
-#     def __init__(self, per_second_rate, min_duration_ms_between_requests):
-#         self.__per_second_rate = per_second_rate
-#         self.__min_duration_ms_between_requests = min_duration_ms_between_requests
-#         self.__last_request_time = 0
-#         self.__request_times = [0] * per_second_rate
-#         self.__curr_idx = 0
+class RateLimiter:
+    def __init__(self, per_second_rate, min_duration_ms_between_requests):
+        self.__per_second_rate = per_second_rate
+        self.__min_duration_ms_between_requests = min_duration_ms_between_requests
+        self.__last_request_time = 0
+        self.__request_times = [0] * per_second_rate
+        self.__curr_idx = 0
 
-#     @contextlib.asynccontextmanager
-#     async def acquire(self, timeout_ms=0):
-#         enter_ms = timestamp_ms()
-#         while True:
-#             now = timestamp_ms()
-#             if now - enter_ms > timeout_ms > 0:
-#                 raise RateLimiterTimeout()
+    @contextlib.asynccontextmanager
+    async def acquire(self, timeout_ms=0):
+        enter_ms = timestamp_ms()
+        while True:
+            now = timestamp_ms()
+            if now - enter_ms > timeout_ms > 0:
+                raise RateLimiterTimeout()
 
-#             if now - self.__last_request_time <= self.__min_duration_ms_between_requests:
-#                 await asyncio.sleep(0.001)
-#                 continue
+            if now - self.__last_request_time <= self.__min_duration_ms_between_requests:
+                await asyncio.sleep(0.001)
+                continue
 
-#             if now - self.__request_times[self.__curr_idx] <= 1000:
-#                 await asyncio.sleep(0.001)
-#                 continue
+            if now - self.__request_times[self.__curr_idx] <= 1000:
+                await asyncio.sleep(0.001)
+                continue
 
-#             break
+            break
 
-#         self.__last_request_time = self.__request_times[self.__curr_idx] = now
-#         self.__curr_idx = (self.__curr_idx + 1) % self.__per_second_rate
-#         yield self
+        self.__last_request_time = self.__request_times[self.__curr_idx] = now
+        self.__curr_idx = (self.__curr_idx + 1) % self.__per_second_rate
+        yield self
 
 
 async def exchange_facing_worker(url: str, api_key: str, queue: Queue, logger: logging.Logger, request_counter):
-    #Use asyncio's Throttler instead of custom Rate Limiter
-    rate_limiter = Throttler(PER_SEC_RATE, period=1) #Throttler(RATE, PERIOD)
+    rate_limiter = RateLimiter(PER_SEC_RATE, DURATION_MS_BETWEEN_REQUESTS)
 
     async with aiohttp.ClientSession() as session:
         while True:
@@ -114,12 +113,7 @@ async def exchange_facing_worker(url: str, api_key: str, queue: Queue, logger: l
 
             try:
                 nonce = timestamp_ms()
-                async with rate_limiter:
-                    #Check that request has not timed out before ratelimiter is acquired
-                    remaining_ttl = REQUEST_TTL_MS - (timestamp_ms() - request.create_time)
-                    if remaining_ttl <= 0:
-                        raise RateLimiterTimeout()
-                    
+                async with rate_limiter.acquire(timeout_ms=remaining_ttl):
                     async with async_timeout.timeout(1.0):
                         data = {'api_key': api_key, 'nonce': nonce, 'req_id': request.req_id}
                         async with session.request('GET',
