@@ -16,6 +16,7 @@ from asyncio_throttle import Throttler
 PER_SEC_RATE = 20
 DURATION_MS_BETWEEN_REQUESTS = int(1000 / PER_SEC_RATE)
 REQUEST_TTL_MS = 1000
+MAX_RETRIES = 1 #Maximum number of retries for expired requests
 VALID_API_KEYS = ['UT4NHL1J796WCHULA1750MXYF9F5JYA6',
                   '8TY2F3KIL38T741G1UCBMCAQ75XU9F5O',
                   '954IXKJN28CBDKHSKHURQIVLQHZIEEM9',
@@ -102,14 +103,21 @@ class RateLimiterTimeout(Exception):
 
 async def exchange_facing_worker(url: str, api_key: str, queue: Queue, logger: logging.Logger, request_counter):
     #Use asyncio's Throttler instead of custom Rate Limiter
-    rate_limiter = Throttler(PER_SEC_RATE, period=1) #Throttler(RATE, PERIOD)
+    rate_limiter = Throttler(PER_SEC_RATE + 10, period=1) #Throttler(RATE, PERIOD)
 
     async with aiohttp.ClientSession() as session:
         while True:
             request: Request = await queue.get()
             remaining_ttl = REQUEST_TTL_MS - (timestamp_ms() - request.create_time)
             if remaining_ttl <= 0:
-                logger.warning(f"ignoring request {request.req_id} from queue due to TTL")
+                if request.retries < MAX_RETRIES:
+                    request.retries += 1
+                    request.create_time = timestamp_ms()  # Reset creation time for fresh TTL
+                    queue.put_nowait(request)
+                    logger.warning(f"Request {request.req_id} expired. Requeueing attempt {request.retries}.")
+                else:
+                    request_counter["ignored"] += 1
+                    logger.error(f"Request {request.req_id} failed permanently after {request.retries} retries.")
                 continue
 
             try:
@@ -118,7 +126,15 @@ async def exchange_facing_worker(url: str, api_key: str, queue: Queue, logger: l
                     #Check that request has not timed out before ratelimiter is acquired
                     remaining_ttl = REQUEST_TTL_MS - (timestamp_ms() - request.create_time)
                     if remaining_ttl <= 0:
-                        raise RateLimiterTimeout()
+                        if request.retries < MAX_RETRIES:
+                            request.retries += 1
+                            request.create_time = timestamp_ms()  # Reset creation time for fresh TTL
+                            queue.put_nowait(request)
+                            logger.warning(f"Request {request.req_id} expired. Requeueing attempt {request.retries}.")
+                            continue
+                        else:
+                            request_counter["ignored"] += 1
+                            raise RateLimiterTimeout()
                     
                     async with async_timeout.timeout(1.0):
                         data = {'api_key': api_key, 'nonce': nonce, 'req_id': request.req_id}
@@ -135,7 +151,7 @@ async def exchange_facing_worker(url: str, api_key: str, queue: Queue, logger: l
                 logger.warning(f"ignoring request {request.req_id} in limiter due to TTL")
 
 #Function to log average requests per second
-async def log_request_rate(request_counter):
+async def log_request_rate(request_counter, logger):
     start_time = timestamp_ms()
     while True:
         await asyncio.sleep(1)  #Report every second
@@ -143,27 +159,30 @@ async def log_request_rate(request_counter):
         if elapsed_time > 0:
             avg_requests_per_second = request_counter['successful'] / elapsed_time
             avg_requests_generated_per_second = request_counter['generated'] / elapsed_time
-            print(f"Avg Successful Requests per Second: {avg_requests_per_second:.2f} (Total: {request_counter['total']})")
-            print(f"Avg Requests generated per Second: {avg_requests_generated_per_second:.2f}")
+            avg_requests_ignored_per_second = request_counter['ignored'] / elapsed_time
+            logger.info(f"Avg Successful Requests per Second: {avg_requests_per_second:.2f} (Total: {request_counter['total']})")
+            logger.info(f"Avg Requests generated per Second: {avg_requests_generated_per_second:.2f}")
+            logger.info(f"Avg Requests ignored per Second: {avg_requests_ignored_per_second:.2f}")
         else:
-            print("No requests yet.")
+            logger.info("No requests yet.")
 
 class Request:
     def __init__(self, req_id):
         self.req_id = req_id
         self.create_time = timestamp_ms()
+        self.retries = 0 #Track the number of requeue attempts
 
 
 def main():
     url = "http://127.0.0.1:9999/api/request"
     loop = asyncio.get_event_loop()
     queue = Queue()
+    logger = configure_logger()
 
     #Track successful requests and generated requests rates
-    request_counter = {'total': 0, 'successful': 0, 'generated': 0}  # Counter for requests
-    loop.create_task(log_request_rate(request_counter))
+    request_counter = {'total': 0, 'successful': 0, 'generated': 0, 'ignored':0}  # Counter for requests
+    loop.create_task(log_request_rate(request_counter, logger))
     
-    logger = configure_logger()
     loop.create_task(generate_requests(queue=queue, request_counter = request_counter))
 
     for api_key in VALID_API_KEYS:
