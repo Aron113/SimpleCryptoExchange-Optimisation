@@ -104,5 +104,5 @@ def api_blocked(e):
     return jsonify({"status": "error", "error_msg": "too many rate limit errors: blocked"}), 429
 
 
-app.run(port=9999)
+app.run(port=9999, debug= True)
 
